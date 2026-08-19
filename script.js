@@ -8,7 +8,7 @@ const EXCHANGES = {
 
 const HISTORY_RANGE = '6mo';
 const HISTORY_INTERVAL = '1d';
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1시간 캐시
+const CACHE_TTL_MS = 60 * 60 * 1000;
 const CACHE_KEY_PREFIX = 'scanner_cache_universe_';
 
 let IS_SCANNING = false;
@@ -16,9 +16,9 @@ let CONCURRENCY = 6;
 let failCount = 0;
 let lastHudRenderTime = 0;
 
-// 지표 가중치 정의 (소셜 버즈 포함 총 10대 지표)
+// 지표 가중치 정의
 const INDICATORS = [
-  { key: 'social_buzz', label: '💬 커뮤니티 언급·댓글 급증', weight: 15 },
+  { key: 'social_buzz', label: '💬 실시간 커뮤니티 버즈·심리', weight: 15 },
   { key: 'shakeout',    label: '⚡ 저점 매물 흡수 (Shakeout)',   weight: 15 },
   { key: 'cmf',         label: 'CMF 자금유입 (기관 매집)',     weight: 14 },
   { key: 'rvol',        label: 'RVOL 상대 거래량 급증',        weight: 14 },
@@ -41,7 +41,6 @@ function num(v) {
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-// 프록시 API 호출 (지수 백오프 및 Rate Limit 방어)
 async function fetchViaProxy(targetUrl, { tries = 3, label = '' } = {}) {
   const url = PROXY + encodeURIComponent(targetUrl);
   let lastErr;
@@ -64,7 +63,6 @@ async function fetchViaProxy(targetUrl, { tries = 3, label = '' } = {}) {
   throw new Error(`${label || targetUrl} 요청 실패: ${lastErr ? lastErr.message : 'unknown'}`);
 }
 
-// 스팩/부실 우선주 필터링
 function isCommonStock(item) {
   const code = (item.code || '').trim().toUpperCase();
   const name = (item.name || '').toLowerCase();
@@ -142,6 +140,69 @@ async function fetchHistory(symbol) {
     });
   }
   return bars;
+}
+
+// -------------------------------------------------------------
+// [1번 보완] 실제 StockTwits 커뮤니티 데이터 조회 및 분석 엔진
+// -------------------------------------------------------------
+async function fetchStockTwitsBuzz(symbol, bars, n, curRvol) {
+  try {
+    const target = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(symbol)}.json`;
+    const json = await fetchViaProxy(target, { tries: 1, label: `${symbol} 버즈` });
+    const messages = json?.messages || [];
+
+    if (messages.length > 0) {
+      const now = Date.now();
+      // 최근 24시간 내 올라온 메시지 필터
+      const recentMsgs = messages.filter(m => (now - new Date(m.created_at).getTime()) < 24 * 3600 * 1000);
+      const msgCount = recentMsgs.length;
+
+      let bullish = 0, bearish = 0;
+      messages.forEach(m => {
+        const sentiment = m.entities?.sentiment?.basic;
+        if (sentiment === 'Bullish') bullish++;
+        if (sentiment === 'Bearish') bearish++;
+      });
+
+      const bullishRatio = (bullish + bearish) > 0 ? (bullish / (bullish + bearish)) * 100 : 50;
+
+      // 24시간 내 글 15개 이상 & 매수 우위(60% 이상)일 때 강력 버즈 판정
+      if (msgCount >= 15 && bullishRatio >= 60) {
+        return {
+          status: 'crossed',
+          buzzIndex: msgCount,
+          labelText: `🔥 트윗 급증 (${msgCount}건/Bull ${bullishRatio.toFixed(0)}%)`
+        };
+      } else if (msgCount >= 8 || bullishRatio >= 70) {
+        return {
+          status: 'imminent',
+          buzzIndex: msgCount,
+          labelText: `관심 유입 (${msgCount}건)`
+        };
+      }
+      return {
+        status: 'none',
+        buzzIndex: msgCount,
+        labelText: `보통 (${msgCount}건)`
+      };
+    }
+  } catch (e) {
+    // API 제한이나 종목 미존재 시 자체 가격/거래량 수식 모델로 자동 폴백
+  }
+
+  // 폴백 수식 (거래량 급증 & 변동성 수렴)
+  const volumes = bars.map(b => b.volume);
+  const recent3Vol = sma(volumes, 3)[n - 1] || 1;
+  const prior15Vol = sma(volumes, 15)[n - 4] || 1;
+  const volSurge = recent3Vol / Math.max(prior15Vol, 1);
+  const buzzIndex = (volSurge * 0.65) + (curRvol * 0.35);
+
+  if (buzzIndex >= 2.5) {
+    return { status: 'crossed', buzzIndex, labelText: `모멘텀 급증 (+${(buzzIndex * 100).toFixed(0)}%)` };
+  } else if (buzzIndex >= 1.6) {
+    return { status: 'imminent', buzzIndex, labelText: '모멘텀 유입' };
+  }
+  return { status: 'none', buzzIndex: 1.0, labelText: '보통' };
 }
 
 // -------------------------------------------------------------
@@ -277,7 +338,6 @@ function crossState(shortArr, longArr, lookback = 3, imminentGapPct = 3) {
   return { status: 'none' };
 }
 
-// 개미털기(Shakeout) 패턴 포착
 function detectEarlyShakeout(bars, recentLow, n) {
   const last = bars[n - 1].close;
   const distFromLow = (last - recentLow) / (recentLow || 1);
@@ -314,41 +374,16 @@ function detectEarlyShakeout(bars, recentLow, n) {
 }
 
 // -------------------------------------------------------------
-// [신규] 커뮤니티(토스/네이버/레딧) 소셜 버즈 급증 추정 지표
-// -------------------------------------------------------------
-function calculateCommunityBuzz(bars, n, curRvol) {
-  const volumes = bars.map(b => b.volume);
-  const closes = bars.map(b => b.close);
-
-  // 최근 3일간 거래량과 그 전 15일간의 거래량 비교
-  const recent3Vol = sma(volumes, 3)[n - 1] || 1;
-  const prior15Vol = sma(volumes, 15)[n - 4] || 1;
-  const volSurge = recent3Vol / Math.max(prior15Vol, 1);
-
-  // 가격 변동성 대비 비정상적 거래량 유입(글/댓글 폭증 패턴)
-  const ret3 = Math.abs((closes[n - 1] - closes[n - 4]) / (closes[n - 4] || 1));
-  const buzzIndex = (volSurge * 0.65) + (curRvol * 0.35);
-
-  let status = 'none';
-  let labelText = '보통';
-
-  if (buzzIndex >= 2.8 || (volSurge >= 2.5 && ret3 <= 0.15)) {
-    status = 'crossed'; // 조용하다가 언급 및 관심 폭증
-    labelText = `버즈 급증 (+${(buzzIndex * 100).toFixed(0)}%)`;
-  } else if (buzzIndex >= 1.7) {
-    status = 'imminent';
-    labelText = '관심 유입 중';
-  }
-
-  return { status, buzzIndex, labelText };
-}
-
-// -------------------------------------------------------------
-// SVG 차트 렌더링 함수
+// [3번 보완] 상하 영역 분리 정밀 SVG 차트 렌더링 함수
 // -------------------------------------------------------------
 function renderHudSvgChart(bars, ma20, ma60, bbUpper, bbLower, recentLow, shakeoutInfo, macdLine, rsi9) {
   if (!bars || bars.length < 20 || !els.hudDynamicSvg) return;
-  const W = 480, H = 145, PAD_X = 8, PAD_Y = 12;
+  const W = 480, H = 145, PAD_X = 8;
+  
+  // 영역 분할: 상단 메인 가격 영역 (Top: 6, Bottom: 92), 하단 오실레이터 영역 (Top: 100, Bottom: 140)
+  const P_TOP = 6, P_BOTTOM = 92;
+  const S_TOP = 100, S_BOTTOM = 140;
+
   const sliceBars = bars.slice(-40);
   const n = sliceBars.length;
   const closes = sliceBars.map((b) => b.close);
@@ -360,74 +395,99 @@ function renderHudSvgChart(bars, ma20, ma60, bbUpper, bbLower, recentLow, shakeo
   const sliceBbU = (bbUpper || []).slice(startIdx);
   const sliceBbL = (bbLower || []).slice(startIdx);
 
+  // 상단 가격 스케일
   const validVals = [...closes, ...sliceMa20, ...sliceMa60, ...sliceBbU, ...sliceBbL, recentLow].filter(v => typeof v === 'number' && !Number.isNaN(v));
   const minVal = Math.min(...validVals);
   const maxVal = Math.max(...validVals);
   const range = maxVal - minVal || 1;
-  const maxVol = Math.max(...volumes) || 1;
 
   const getX = (i) => PAD_X + (i / (n - 1)) * (W - PAD_X * 2);
-  const getY = (val) => H - PAD_Y - ((val - minVal) / range) * (H - PAD_Y * 2);
+  const getYPrice = (val) => P_BOTTOM - ((val - minVal) / range) * (P_BOTTOM - P_TOP);
 
+  // 하단 거래량 바 (상단 차트 배경에 옅게 깔기)
+  const maxVol = Math.max(...volumes) || 1;
   const volBars = sliceBars.map((b, i) => {
-    const vH = (b.volume / maxVol) * 26;
+    const vH = (b.volume / maxVol) * 22;
     const x = getX(i) - 2;
-    const y = H - vH - 2;
+    const y = P_BOTTOM - vH;
     const isUp = b.close >= b.open;
-    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="4" height="${vH.toFixed(1)}" fill="${isUp ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.22)'}" />`;
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="4" height="${vH.toFixed(1)}" fill="${isUp ? 'rgba(34,197,94,0.18)' : 'rgba(239,68,68,0.15)'}" />`;
   }).join('');
 
-  const pricePts = closes.map((c, i) => `${getX(i).toFixed(1)},${getY(c).toFixed(1)}`).join(' ');
-  const ma20Pts = sliceMa20.map((m, i) => Number.isNaN(m) ? null : `${getX(i).toFixed(1)},${getY(m).toFixed(1)}`).filter(Boolean).join(' ');
-  const ma60Pts = sliceMa60.map((m, i) => Number.isNaN(m) ? null : `${getX(i).toFixed(1)},${getY(m).toFixed(1)}`).filter(Boolean).join(' ');
-  const bbUPts = sliceBbU.map((u, i) => Number.isNaN(u) ? null : `${getX(i).toFixed(1)},${getY(u).toFixed(1)}`).filter(Boolean).join(' ');
-  const bbLPts = sliceBbL.map((l, i) => Number.isNaN(l) ? null : `${getX(i).toFixed(1)},${getY(l).toFixed(1)}`).filter(Boolean).join(' ');
-  const baseLineY = getY(recentLow).toFixed(1);
+  const pricePts = closes.map((c, i) => `${getX(i).toFixed(1)},${getYPrice(c).toFixed(1)}`).join(' ');
+  const ma20Pts = sliceMa20.map((m, i) => Number.isNaN(m) ? null : `${getX(i).toFixed(1)},${getYPrice(m).toFixed(1)}`).filter(Boolean).join(' ');
+  const ma60Pts = sliceMa60.map((m, i) => Number.isNaN(m) ? null : `${getX(i).toFixed(1)},${getYPrice(m).toFixed(1)}`).filter(Boolean).join(' ');
+  const bbUPts = sliceBbU.map((u, i) => Number.isNaN(u) ? null : `${getX(i).toFixed(1)},${getYPrice(u).toFixed(1)}`).filter(Boolean).join(' ');
+  const bbLPts = sliceBbL.map((l, i) => Number.isNaN(l) ? null : `${getX(i).toFixed(1)},${getYPrice(l).toFixed(1)}`).filter(Boolean).join(' ');
+  const baseLineY = getYPrice(recentLow).toFixed(1);
 
   let shakeoutMarker = '';
   if (shakeoutInfo && shakeoutInfo.status === 'crossed' && shakeoutInfo.shakeoutIndex !== undefined) {
     const localIdx = shakeoutInfo.shakeoutIndex - startIdx;
     if (localIdx >= 0 && localIdx < n) {
       const sX = getX(localIdx).toFixed(1);
-      const sY = getY(shakeoutInfo.shakeoutPrice).toFixed(1);
+      const sY = getYPrice(shakeoutInfo.shakeoutPrice).toFixed(1);
       shakeoutMarker = `
-        <circle cx="${sX}" cy="${sY}" r="5" fill="none" stroke="var(--shakeout)" stroke-width="1.8" />
-        <text x="${sX}" y="${Number(sY) + 12}" fill="var(--shakeout)" font-family="JetBrains Mono" font-size="8" font-weight="700" text-anchor="middle">SHAKEOUT</text>
+        <circle cx="${sX}" cy="${sY}" r="4.5" fill="none" stroke="var(--shakeout)" stroke-width="1.8" />
+        <text x="${sX}" y="${Number(sY) + 11}" fill="var(--shakeout)" font-family="JetBrains Mono" font-size="7.5" font-weight="700" text-anchor="middle">SHAKEOUT</text>
       `;
     }
   }
 
-  const sliceMacd = (macdLine || []).slice(startIdx);
+  // 하단 오실레이터 (RSI & MACD 정규화)
   const sliceRsi = (rsi9 || []).slice(startIdx);
-  const macdMin = Math.min(...sliceMacd.filter(x => !Number.isNaN(x))) || -1;
-  const macdMax = Math.max(...sliceMacd.filter(x => !Number.isNaN(x))) || 1;
+  const rsiPts = sliceRsi.map((v, i) => {
+    if (Number.isNaN(v)) return null;
+    const y = S_BOTTOM - (v / 100) * (S_BOTTOM - S_TOP);
+    return `${getX(i).toFixed(1)},${y.toFixed(1)}`;
+  }).filter(Boolean).join(' ');
+
+  const sliceMacd = (macdLine || []).slice(startIdx);
+  const validMacd = sliceMacd.filter(x => !Number.isNaN(x));
+  const macdMin = Math.min(...validMacd, -0.1);
+  const macdMax = Math.max(...validMacd, 0.1);
   const macdRange = macdMax - macdMin || 1;
-  const macdMiniPts = sliceMacd.map((v, i) => Number.isNaN(v) ? null : `${getX(i).toFixed(1)},${(20 - ((v - macdMin) / macdRange) * 16).toFixed(1)}`).filter(Boolean).join(' ');
-  const rsiMiniPts = sliceRsi.map((v, i) => Number.isNaN(v) ? null : `${getX(i).toFixed(1)},${(40 - (v / 100) * 16).toFixed(1)}`).filter(Boolean).join(' ');
+  const macdPts = sliceMacd.map((v, i) => {
+    if (Number.isNaN(v)) return null;
+    const y = S_BOTTOM - ((v - macdMin) / macdRange) * (S_BOTTOM - S_TOP);
+    return `${getX(i).toFixed(1)},${y.toFixed(1)}`;
+  }).filter(Boolean).join(' ');
+
+  const rsiMidY = (S_TOP + (S_BOTTOM - S_TOP) * 0.5).toFixed(1);
 
   els.hudDynamicSvg.innerHTML = `
+    <!-- 배경 거래량 -->
     <g class="hud-vol-layer">${volBars}</g>
-    <line x1="${PAD_X}" y1="${H*0.25}" x2="${W-PAD_X}" y2="${H*0.25}" stroke="rgba(255,255,255,0.03)" stroke-width="1" />
-    <line x1="${PAD_X}" y1="${H*0.5}" x2="${W-PAD_X}" y2="${H*0.5}" stroke="rgba(255,255,255,0.03)" stroke-width="1" />
-    <line x1="${PAD_X}" y1="${H*0.75}" x2="${W-PAD_X}" y2="${H*0.75}" stroke="rgba(255,255,255,0.03)" stroke-width="1" />
-    <line x1="${PAD_X}" y1="${baseLineY}" x2="${W-PAD_X}" y2="${baseLineY}" stroke="var(--up)" stroke-width="1.2" stroke-dasharray="4,4" />
-    <text x="${W-PAD_X-4}" y="${baseLineY - 3}" fill="var(--up)" font-family="JetBrains Mono" font-size="8.5" text-anchor="end">SUPPORT $${recentLow.toFixed(2)}</text>
-    ${bbUPts ? `<polyline fill="none" stroke="rgba(56,189,248,0.3)" stroke-width="1" stroke-dasharray="2,2" points="${bbUPts}" />` : ''}
-    ${bbLPts ? `<polyline fill="none" stroke="rgba(56,189,248,0.3)" stroke-width="1" stroke-dasharray="2,2" points="${bbLPts}" />` : ''}
-    ${ma60Pts ? `<polyline fill="none" stroke="var(--purple)" stroke-width="1.4" opacity="0.85" stroke-linecap="round" points="${ma60Pts}" />` : ''}
-    ${ma20Pts ? `<polyline fill="none" stroke="var(--red)" stroke-width="1.6" stroke-linecap="round" points="${ma20Pts}" />` : ''}
-    <polyline fill="none" stroke="var(--text)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" points="${pricePts}" />
-    ${macdMiniPts ? `<polyline fill="none" stroke="rgba(239,68,68,0.4)" stroke-width="1" stroke-dasharray="2,2" points="${macdMiniPts}" />` : ''}
-    ${rsiMiniPts ? `<polyline fill="none" stroke="rgba(168,85,247,0.4)" stroke-width="1" points="${rsiMiniPts}" />` : ''}
+    
+    <!-- 상단 가격 뷰 구분 그리드 -->
+    <line x1="${PAD_X}" y1="${P_TOP}" x2="${W-PAD_X}" y2="${P_TOP}" stroke="rgba(255,255,255,0.03)" stroke-width="1" />
+    <line x1="${PAD_X}" y1="${baseLineY}" x2="${W-PAD_X}" y2="${baseLineY}" stroke="var(--up)" stroke-width="1.2" stroke-dasharray="3,3" />
+    <text x="${W-PAD_X-4}" y="${baseLineY - 3}" fill="var(--up)" font-family="JetBrains Mono" font-size="8" text-anchor="end">SUPPORT $${recentLow.toFixed(2)}</text>
+    
+    <!-- 지표 라인 -->
+    ${bbUPts ? `<polyline fill="none" stroke="rgba(56,189,248,0.25)" stroke-width="1" stroke-dasharray="2,2" points="${bbUPts}" />` : ''}
+    ${bbLPts ? `<polyline fill="none" stroke="rgba(56,189,248,0.25)" stroke-width="1" stroke-dasharray="2,2" points="${bbLPts}" />` : ''}
+    ${ma60Pts ? `<polyline fill="none" stroke="var(--purple)" stroke-width="1.2" opacity="0.8" stroke-linecap="round" points="${ma60Pts}" />` : ''}
+    ${ma20Pts ? `<polyline fill="none" stroke="var(--red)" stroke-width="1.5" stroke-linecap="round" points="${ma20Pts}" />` : ''}
+    <polyline fill="none" stroke="var(--text)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="${pricePts}" />
     ${shakeoutMarker}
-    <circle cx="${getX(n-1)}" cy="${getY(closes[n-1])}" r="3.5" fill="var(--red)" />
+    <circle cx="${getX(n-1)}" cy="${getYPrice(closes[n-1])}" r="3" fill="var(--red)" />
+
+    <!-- 상/하단 분할선 -->
+    <line x1="${PAD_X}" y1="${S_TOP - 4}" x2="${W-PAD_X}" y2="${S_TOP - 4}" stroke="rgba(255,255,255,0.08)" stroke-width="1" />
+
+    <!-- 하단 서브 오실레이터 뷰 (RSI 50선 + MACD/RSI 곡선) -->
+    <line x1="${PAD_X}" y1="${rsiMidY}" x2="${W-PAD_X}" y2="${rsiMidY}" stroke="rgba(255,255,255,0.06)" stroke-dasharray="2,2" />
+    <text x="${PAD_X + 2}" y="${S_TOP + 8}" fill="var(--text-faint)" font-family="JetBrains Mono" font-size="7">RSI / MACD</text>
+    ${macdPts ? `<polyline fill="none" stroke="rgba(239,68,68,0.6)" stroke-width="1" stroke-dasharray="2,2" points="${macdPts}" />` : ''}
+    ${rsiPts ? `<polyline fill="none" stroke="rgba(168,85,247,0.7)" stroke-width="1.2" points="${rsiPts}" />` : ''}
   `;
 }
 
 // -------------------------------------------------------------
-// 종합 퀀트 및 소셜 버즈 분석 함수
+// 종합 퀀트 및 버즈 분석 함수
 // -------------------------------------------------------------
-function analyzeStock(meta, bars, minDollarVol, onHudUpdate) {
+async function analyzeStock(meta, bars, minDollarVol, onHudUpdate) {
   if (!bars || bars.length < 45) return null;
 
   const closes = bars.map((b) => b.close);
@@ -484,9 +544,10 @@ function analyzeStock(meta, bars, minDollarVol, onHudUpdate) {
   const upDownRatio = downVolSum === 0 ? 2.0 : upVolSum / downVolSum;
 
   const shakeoutInfo = detectEarlyShakeout(bars, recentLow, n);
-  const buzzInfo = calculateCommunityBuzz(bars, n, curRvol);
+  
+  // 실시간 StockTwits 버즈 분석 호출
+  const buzzInfo = await fetchStockTwitsBuzz(meta.code, bars, n, curRvol);
 
-  // HUD 업데이트 (쓰로틀링 적용)
   if (onHudUpdate) {
     onHudUpdate({
       ticker: meta.code, name: meta.name, price: last, avgVol: avgVol20, dVol: avgDollarVol20,
@@ -495,7 +556,6 @@ function analyzeStock(meta, bars, minDollarVol, onHudUpdate) {
     });
   }
 
-  // 지표 시그널 판정
   const signals = {};
   signals.social_buzz = buzzInfo;
   signals.shakeout = shakeoutInfo;
@@ -572,7 +632,7 @@ function analyzeStock(meta, bars, minDollarVol, onHudUpdate) {
 }
 
 // -------------------------------------------------------------
-// UI 바인딩 및 렌더링
+// UI 바인딩 및 이벤트
 // -------------------------------------------------------------
 const els = {};
 function cacheEls() {
@@ -621,10 +681,9 @@ function updateFailBanner() {
     return;
   }
   els.hudFailBanner.style.display = 'block';
-  els.hudFailText.textContent = `요청 실패 ${failCount}건 발생. 결과가 적으면 동시 처리 수를 낮추고 재시도하세요.`;
+  els.hudFailText.textContent = `요청 실패 ${failCount}건 발생. 동시 처리 수를 낮추고 재시도해보세요.`;
 }
 
-// 결과 목록 렌더링 & 카드 클릭 시 해당 종목 차트 팝업 연동
 function renderResults(list) {
   els.resultsList.innerHTML = '';
   els.resultsCount.textContent = `${list.length}개 포착`;
@@ -655,7 +714,7 @@ function renderResults(list) {
 
     const reasons = [];
     if (r.hasBuzzSurge) {
-      reasons.push(`<b style="color:var(--buzz)">[💬 커뮤니티 관심 급증]</b> 조용하던 게시판 댓글·언급 모멘텀 폭증 포착`);
+      reasons.push(`<b style="color:var(--buzz)">[💬 실시간 커뮤니티]</b> ${r.signals.social_buzz.labelText}`);
     }
     if (r.hasShakeout) {
       reasons.push(`<b style="color:var(--shakeout)">[⚡ 저점 매물 흡수]</b> 일시적 지지선 하향 이탈 후 +${r.distFromLowPct.toFixed(1)}% 이내 빠른 복귀`);
@@ -688,7 +747,6 @@ function renderResults(list) {
       </div>
     `;
 
-    // 카드 클릭 시 HUD 차트 뷰어로 데이터 다시 띄우기
     card.addEventListener('click', () => {
       els.hudCurrentTicker.textContent = r.meta.code;
       els.hudCurrentName.textContent = r.meta.name;
@@ -707,7 +765,6 @@ function parseWhitelist(raw) {
   return set.size ? set : null;
 }
 
-// 1차 유니버스 빌드
 async function buildUniverse(minPrice, maxPrice) {
   if (els.modeCustom.checked) {
     const raw = els.customTickers.value || '';
@@ -757,7 +814,7 @@ async function buildUniverse(minPrice, maxPrice) {
 }
 
 // -------------------------------------------------------------
-// 스캔 파이프라인 실행 엔진 (큐 방식 및 UI 쓰로틀링)
+// 스캔 파이프라인 실행 엔진
 // -------------------------------------------------------------
 async function runScan() {
   IS_SCANNING = true;
@@ -778,7 +835,7 @@ async function runScan() {
   els.scanBtn.disabled = true;
   updateFailBanner();
 
-  appendHudLog('정밀 분석 & 소셜 모멘텀 스캐너 시작');
+  appendHudLog('정밀 분석 & 실시간 커뮤니티 버즈 스캐너 시작');
 
   try {
     const candidates = await buildUniverse(minPrice, maxPrice);
@@ -797,7 +854,6 @@ async function runScan() {
     let completedCount = 0;
     const startTime = Date.now();
 
-    // 워커 작업 풀 (동시성 큐 방식)
     const worker = async () => {
       while (IS_SCANNING) {
         if (queueIndex >= candidates.length) break;
@@ -806,12 +862,11 @@ async function runScan() {
         try {
           const bars = await fetchHistory(c.code);
           if (bars && bars.length) {
-            const res = analyzeStock(
+            const res = await analyzeStock(
               { code: c.code, name: c.name, market: c.market, changeRate: c.changeRate || 0 },
               bars,
               minDollarVol,
               (info) => {
-                // UI 렌더링 쓰로틀링 (120ms)
                 const now = Date.now();
                 if (now - lastHudRenderTime > 120) {
                   lastHudRenderTime = now;
@@ -850,7 +905,7 @@ async function runScan() {
             if (res && !res.dropped) {
               analyzed.push(res);
               if (res.hasBuzzSurge) {
-                appendHudLog(`[💬버즈급증] ${c.code} (${c.name}) - 댓글/언급량 폭증 감지`, 'buzz');
+                appendHudLog(`[💬버즈급증] ${c.code} (${c.name}) - ${res.signals.social_buzz.labelText}`, 'buzz');
               } else if (res.hasShakeout) {
                 appendHudLog(`[⚡매물소화] ${c.code} (${c.name}) - 지지선 복귀 확인`, 'shake');
               } else {
