@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>US 보통주 정밀 매집 & 소셜 버즈 스캐너 Pro</title>
+<title>US 보통주 정밀 매집 & 실시간 버즈 스캐너 Pro</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
@@ -19,7 +19,7 @@
     <div class="scan-hud__header">
       <div class="scan-hud__status">
         <span class="pulse-dot"></span>
-        <span class="scan-hud__title">MARKET SCANNER PIPELINE</span>
+        <span class="scan-hud__title">MARKET PIPELINE MONITOR</span>
       </div>
       <button id="overlayStopBtn" class="hud-stop-btn">스캔 중단</button>
     </div>
@@ -44,7 +44,7 @@
     <div class="hud-card hud-card--active-target">
       <div class="hud-card__head-row">
         <span class="hud-card__label">ACTIVE ANALYZING TICKER</span>
-        <span class="hud-engine-tag" id="hudBuzzStatus">COMMUNITY BUZZ TRACE</span>
+        <span class="hud-engine-tag" id="hudBuzzStatus">REAL-TIME BUZZ</span>
       </div>
       <div class="hud-target-ticker" id="hudCurrentTicker">--</div>
       <div class="hud-target-name" id="hudCurrentName">데이터 수집 및 계산 대기 중…</div>
@@ -65,14 +65,14 @@
         </div>
       </div>
 
-      <!-- 메인 주가 SVG -->
+      <!-- 메인 SVG (상단 가격 / 하단 오실레이터 분리 뷰) -->
       <div class="hud-chart-view" id="hudChartContainer">
         <svg id="hudDynamicSvg" viewBox="0 0 480 145" preserveAspectRatio="none">
-          <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="var(--text-faint)" font-family="JetBrains Mono" font-size="11">CHART ENGINE READY</text>
+          <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="var(--text-faint)" font-family="JetBrains Mono" font-size="11">ENGINE READY</text>
         </svg>
       </div>
 
-      <!-- 6대 서브 메트릭 & 소셜 버즈 지표 -->
+      <!-- 6대 서브 메트릭 지표 -->
       <div class="hud-sub-metrics">
         <div class="sub-metric-card">
           <span class="sub-metric-title">CMF 자금유입</span>
@@ -95,7 +95,7 @@
           <b id="hudObvVal" class="sub-metric-val">--</b>
         </div>
         <div class="sub-metric-card">
-          <span class="sub-metric-title">커뮤니티 버즈</span>
+          <span class="sub-metric-title">실시간 버즈</span>
           <b id="hudBuzzVal" class="sub-metric-val">--</b>
         </div>
       </div>
@@ -118,7 +118,7 @@
   </div>
 </div>
 
-<!-- 메인 대시보드 화면 -->
+<!-- 상단 바 -->
 <header class="topbar">
   <div class="topbar__brand">
     <span class="topbar__mark">■</span>
@@ -240,8 +240,8 @@
     <h2 class="panel__title"><span class="idx">02</span> 분석 가중치 & 지표 목록</h2>
     <ul class="legend__list" id="legendList"></ul>
     <div class="legend__note">
-      <strong>스팩(SPAC) 및 거래정지주 사전 필터링.</strong>
-      주가 변동폭이 극도로 제한된 페이퍼컴퍼니(SPAC)나 부실 거래정지주는 20일 변동폭(1.5%) 기준과 키워드 조합으로 자동 제외됩니다.
+      <strong>스팩(SPAC) 및 거래정지주 자동 필터링</strong>
+      주가 변동폭이 극도로 제한된 페이퍼컴퍼니(SPAC)나 거래정지 부실주는 20일 변동폭(1.5%) 기준과 명칭 필터로 자동 제외됩니다.
     </div>
   </section>
 
@@ -259,7 +259,7 @@
 </main>
 
 <footer class="disclaimer">
-  <p><strong>안내.</strong> 본 시스템은 기술적 지표 및 온라인 소셜 모멘텀(버즈) 데이터를 바탕으로 종목을 스크리닝하는 보조 도구입니다. 제공되는 점수와 신호는 과거 통계 데이터에 기반한 수치이며 투자 수익을 보장하지 않습니다. 최종 투자 판단과 책임은 본인에게 있습니다.</p>
+  <p><strong>안내.</strong> 본 시스템은 기술적 지표 및 실시간 소셜 언급 데이터를 바탕으로 종목을 스크리닝하는 보조 도구입니다. 제공되는 점수와 신호는 과거 통계 데이터에 기반한 수치이며 투자 수익을 보장하지 않습니다. 최종 투자 판단과 책임은 본인에게 있습니다.</p>
 </footer>
 
 <script src="script.js"></script>
